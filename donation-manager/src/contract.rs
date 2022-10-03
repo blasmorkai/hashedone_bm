@@ -1,6 +1,6 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
-use cosmwasm_std::{Addr, Binary, Deps, DepsMut, Env, MessageInfo, Order, Reply, Response, StdResult, SubMsg, SubMsgResult, to_binary, WasmMsg};
+use cosmwasm_std::{Addr, BankMsg, Binary, Deps, DepsMut, Env, MessageInfo, Order, Reply, Response, StdResult, SubMsg, SubMsgResult, to_binary, Uint128, WasmMsg};
 // use cw2::set_contract_version;
 
 use crate::error::ContractError;
@@ -15,6 +15,7 @@ const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
 // Used to identify the Response-Submessages
 pub const PEER_INSTANTIATE_ID: u64 = 1;
 
+// ////////////////////////////////////////INSTANTIATE///////////////////////////////////////////////
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn instantiate(
     deps: DepsMut,
@@ -34,17 +35,18 @@ pub fn instantiate(
 
 }
 
+// ////////////////////////////////////////EXECUTE//////////////////////////////////////////////////
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn execute(
     deps: DepsMut,
-    _env: Env,
+    env: Env,
     info: MessageInfo,
     msg: ExecuteMsg,
 ) -> Result<Response, ContractError> {
     match msg {
         ExecuteMsg::Join { .. } => {join(deps, info)},
         ExecuteMsg::Leave { .. } => {Ok(Response::new())},
-        ExecuteMsg::Donate { .. } => {Ok(Response::new())},
+        ExecuteMsg::Donate { .. } => {donate(deps, env, info)},
     }
 
 
@@ -82,6 +84,61 @@ fn join (deps:DepsMut, info:MessageInfo) -> Result<Response, ContractError>{
     Ok(resp)
 }
 
+fn donate (deps: DepsMut, env: Env ,info: MessageInfo) -> Result<Response, ContractError> {
+
+    // For each pair of peer/owner on MEMBERS, query the peer contract and get the donators number
+    let weights: Vec<_> = MEMBERS
+        .keys(deps.storage,None,None,Order::Ascending)
+        .map(|peer| -> StdResult<_> {
+            let peer = peer?;
+            let donators = donation_peer::state::STATE.query(&deps.querier,peer.clone())?.donators;
+            Ok((peer,donators as u128))
+        })
+        .collect::<StdResult<_>>()?;   // The tuple provided in the previous step will join a collection (we can iter() and map() it later)
+
+    //From here weights has got a collection of tuples (peer_address, donator as u128)
+
+    //Add all the donators stored on the weights collection
+    let total_donators : u128 = weights.iter().map(|(_,weight)| weight).sum();
+
+    // Query the blockchain to obtain this contract's balance on all coins
+    let funds = deps.querier.query_all_balances(env.contract.address)?;
+
+    // Double loop: for each Peer/Owner -> Peer/weight. Get a list of its share of all coins on the contract
+    //and create an Option which content is a BankMsg::Send with the peer address and his coins
+    let send_msgs = weights.into_iter().filter_map(|(peer, weights)| {
+        //How many coins owned by the contract belong to the peer in analysis
+        let coins: Vec<_>= funds
+            .iter()
+            .cloned()
+            .map (|mut coin| {
+                coin.amount = Uint128::new(coin.amount.u128() * weights / total_donators);
+                coin
+            })
+            .collect();
+
+        //If there are coins for this peer contract, not zero.....
+        if coins.iter().all(|c| c.amount==Uint128::zero()) {
+            None
+        } else {
+            Some(BankMsg::Send {
+                to_address: peer.to_string(),
+                amount:coins,
+            })
+            // There is a better way of doing this, sending all in one message or through another contract. See video.
+        }
+    });
+
+    let resp = Response::new()
+        .add_messages(send_msgs)
+        .add_attribute("action", "donate")
+        .add_attribute("sender",info.sender.to_string());
+
+    Ok(resp)
+}
+
+
+// ////////////////////////////////////////QUERY////////////////////////////////////////////////////
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
@@ -115,7 +172,7 @@ pub fn query_member_peer_addr(deps: Deps, addr: &str) -> StdResult<MemberPeerAdd
     Ok(MemberPeerAddrResp{ addr: peer })
 }
 
-
+// ////////////////////////////////////////REPLY////////////////////////////////////////////////////
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn reply(deps: DepsMut, _env: Env, msg: Reply) -> Result<Response,ContractError> {
     match msg.id {
@@ -161,7 +218,7 @@ fn peer_instantiate_reply (deps: DepsMut, msg: SubMsgResult) -> Result<Response,
     Ok(resp)
 }
 
-
+// ////////////////////////////////////////TESTS/////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
     use cosmwasm_std::{Addr, coin, Decimal, Empty};
@@ -265,4 +322,83 @@ mod tests {
         assert_eq!(donators_resp.donators,0);
     }
 
+
+    #[test]
+    fn single_peer_single_donate() {
+        // // After a single donation, the only peer should got the whole amount
+        //
+        // let mut app = App::new(|router, _api, storage| {
+        //     router
+        //         .bank
+        //         .init_balance(storage, &Addr::unchecked("donator"), coins(100, "utgd"))
+        //         .unwrap();
+        // });
+        // let peer_code_id = app.store_code(peer());
+        // let manager_code_id = app.store_code(manager());
+        //
+        // let manager = app
+        //     .instantiate_contract(
+        //         manager_code_id,
+        //         Addr::unchecked("admin"),
+        //         &InstantiateMsg {
+        //             peer_code_id,
+        //             incremental_donation: coin(100, "utgd"),
+        //             collective_ratio: Decimal::percent(60),
+        //         },
+        //         &[],
+        //         "manager",
+        //         None,
+        //     )
+        //     .unwrap();
+        //
+        // app.execute_contract(
+        //     Addr::unchecked("member"),
+        //     manager.clone(),
+        //     &ExecMsg::Join {},
+        //     &[],
+        // )
+        // .unwrap();
+        //
+        // let peer: MemberPeerAddrResp = app
+        //     .wrap()
+        //     .query_wasm_smart(
+        //         manager,
+        //         &QueryMsg::MemberPeerAddr {
+        //             addr: "member".to_owned(),
+        //         },
+        //     )
+        //     .unwrap();
+        //
+        // app.execute_contract(
+        //     Addr::unchecked("donator"),
+        //     peer.addr.clone(),
+        //     &PeerExec::Donate {},
+        //     &coins(100, "utgd"),
+        // )
+        // .unwrap();
+        //
+        // app.execute_contract(
+        //     Addr::unchecked("member"),
+        //     peer.addr.clone(),
+        //     &PeerExec::Withdraw {},
+        //     &[],
+        // )
+        // .unwrap();
+        //
+        // assert_eq!(
+        //     coin(0, "utgd"),
+        //     app.wrap().query_balance("donator", "utgd").unwrap()
+        // );
+        // assert_eq!(
+        //     coin(0, "utgd"),
+        //     app.wrap()
+        //         .query_balance(peer.addr.as_str(), "utgd")
+        //         .unwrap()
+        // );
+        // assert_eq!(
+        //     coin(100, "utgd"),
+        //     app.wrap().query_balance("member", "utgd").unwrap()
+        // );
+    }
+    
 }
